@@ -1,0 +1,242 @@
+import sys
+from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QVBoxLayout, QWidget, QMessageBox
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QFont, QIcon
+import speech_recognition as sr
+import serial
+import time
+import traceback
+
+class VoiceThread(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        self.running = True
+        self.recognizer = sr.Recognizer()
+        self.microphone = None
+        self.initialize_microphone()
+        
+    def initialize_microphone(self):
+        try:
+            self.microphone = sr.Microphone()
+            with self.microphone as source:
+                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        except Exception as e:
+            self.error.emit(f"Mikrofon başlatılamadı: {str(e)}")
+            print(f"Mikrofon hatası: {str(e)}")
+            print(traceback.format_exc())
+        
+    def run(self):
+        while self.running:
+            if not self.microphone:
+                self.initialize_microphone()
+                if not self.microphone:
+                    time.sleep(1)
+                    continue
+
+            try:
+                with self.microphone as source:
+                    print("Dinlemeye başladı...")
+                    audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=3)
+                    print("Ses alındı, işleniyor...")
+                    
+                    if not self.running:
+                        break
+                        
+                    text = self.recognizer.recognize_google(audio, language='tr-TR').lower()
+                    print(f"Algılanan metin: {text}")
+                    
+                    # Komut kontrolü
+                    if "kırmızı" in text and ("yak" in text or "aç" in text):
+                        self.finished.emit("kırmızı yak")
+                        break
+                    elif "yeşil" in text and ("yak" in text or "aç" in text):
+                        self.finished.emit("yeşil yak")
+                        break
+                    elif "mavi" in text and ("yak" in text or "aç" in text):
+                        self.finished.emit("mavi yak")
+                        break
+                    elif ("led" in text or "ışık" in text) and ("yak" in text or "aç" in text):
+                        self.finished.emit("ledi yak")
+                        break
+                    elif "kapat" in text or "söndür" in text or "kapa" in text:
+                        self.finished.emit("kapat")
+                        break
+                    else:
+                        self.finished.emit(f"Algılanan: {text} (Geçersiz komut)")
+                    
+            except sr.UnknownValueError:
+                if self.running:
+                    self.finished.emit("📢 Ses algılanamadı, lütfen tekrar deneyin.")
+            except sr.RequestError as e:
+                if self.running:
+                    self.finished.emit("🌐 İnternet bağlantısı hatası!")
+                time.sleep(1)
+            except Exception as e:
+                if self.running:
+                    print(f"Hata: {str(e)}")
+                    print(traceback.format_exc())
+                    self.error.emit(f"⚠️ Hata: {str(e)}")
+                time.sleep(1)
+                self.initialize_microphone()  # Mikrofonun yeniden başlatılması
+    
+    def stop(self):
+        self.running = False
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Sesli LED Kontrol Sistemi")
+        self.setFixedSize(500, 400)
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #2c3e50;
+            }
+            QLabel {
+                color: white;
+                padding: 10px;
+            }
+            QPushButton {
+                background-color: #3498db;
+                color: white;
+                border-radius: 15px;
+                padding: 15px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #2980b9;
+            }
+            QPushButton:pressed {
+                background-color: #2472a4;
+            }
+        """)
+        
+        try:
+            self.arduino = serial.Serial('COM5', 9600, timeout=1)
+            time.sleep(2)
+            print("Arduino bağlantısı başarılı")
+        except:
+            print("Arduino bağlantısı başarısız")
+            self.arduino = None
+        
+        self.voice_thread = None
+        self.setup_ui()
+        
+    def setup_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
+        layout.setAlignment(Qt.AlignCenter)
+        layout.setSpacing(20)
+        
+        title_label = QLabel("🎤 Sesli LED Kontrol Sistemi")
+        title_label.setFont(QFont("Arial", 16, QFont.Bold))
+        title_label.setAlignment(Qt.AlignCenter)
+        
+        commands_label = QLabel("""
+            Kullanılabilir Komutlar:
+            • "Kırmızı LED'i yak"
+            • "Yeşil LED'i yak"
+            • "Mavi LED'i yak"
+            • "LED'i yak" (Tümünü yakar)
+            • "Kapat" veya "Söndür"
+        """)
+        commands_label.setFont(QFont("Arial", 12))
+        commands_label.setAlignment(Qt.AlignCenter)
+        
+        self.listen_button = QPushButton("🎙️ Dinlemeyi Başlat")
+        self.listen_button.setFixedSize(250, 60)
+        self.listen_button.setFont(QFont("Arial", 12, QFont.Bold))
+        
+        self.status_label = QLabel("Sistem Hazır")
+        self.status_label.setFont(QFont("Arial", 12))
+        self.status_label.setAlignment(Qt.AlignCenter)
+        
+        layout.addWidget(title_label)
+        layout.addWidget(commands_label)
+        layout.addWidget(self.listen_button)
+        layout.addWidget(self.status_label)
+        
+        self.listen_button.clicked.connect(self.toggle_listening)
+        
+    def toggle_listening(self):
+        if self.voice_thread is None or not self.voice_thread.running:
+            self.start_listening()
+        else:
+            self.stop_listening()
+            
+    def start_listening(self):
+        try:
+            if self.voice_thread and self.voice_thread.isRunning():
+                self.stop_listening()
+                
+            self.listen_button.setText("🛑 Dinlemeyi Durdur")
+            self.status_label.setText("🎤 Dinleniyor...")
+            self.voice_thread = VoiceThread()
+            self.voice_thread.finished.connect(self.handle_voice_command)
+            self.voice_thread.error.connect(self.handle_error)
+            self.voice_thread.start()
+        except Exception as e:
+            print(f"Dinleme başlatma hatası: {str(e)}")
+            print(traceback.format_exc())
+            self.status_label.setText("⚠️ Dinleme başlatılamadı!")
+    
+    def stop_listening(self):
+        try:
+            if self.voice_thread:
+                self.voice_thread.stop()
+                self.voice_thread.wait(1000)  # 1 saniye bekle
+                if self.voice_thread.isRunning():
+                    self.voice_thread.terminate()
+                self.voice_thread = None
+            self.listen_button.setText("🎙️ Dinlemeyi Başlat")
+            self.status_label.setText("Sistem Hazır")
+        except Exception as e:
+            print(f"Dinleme durdurma hatası: {str(e)}")
+            print(traceback.format_exc())
+    
+    def handle_voice_command(self, command):
+        self.status_label.setText(f"🎯 {command}")
+        
+        if self.arduino:
+            try:
+                if "kırmızı yak" in command:
+                    self.arduino.write(b'R')
+                elif "yeşil yak" in command:
+                    self.arduino.write(b'G')
+                elif "mavi yak" in command:
+                    self.arduino.write(b'B')
+                elif "yak" in command:
+                    self.arduino.write(b'A')
+                elif "kapat" in command:
+                    self.arduino.write(b'X')
+                
+                if "yak" in command or "kapat" in command:
+                    self.stop_listening()
+            except Exception as e:
+                print(f"Arduino komut hatası: {str(e)}")
+                self.status_label.setText("⚠️ Arduino iletişim hatası!")
+    
+    def handle_error(self, error_message):
+        print(f"Hata mesajı: {error_message}")
+        self.status_label.setText(error_message)
+        self.stop_listening()
+        
+    def closeEvent(self, event):
+        self.stop_listening()
+        if self.arduino:
+            self.arduino.close()
+        event.accept()
+
+if __name__ == '__main__':
+    try:
+        app = QApplication(sys.argv)
+        window = MainWindow()
+        window.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        print(f"Program hatası: {str(e)}")
+        print(traceback.format_exc())
